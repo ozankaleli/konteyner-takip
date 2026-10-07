@@ -6,7 +6,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Konteyner & B/L Takip Masası", page_icon="🚢", layout="wide")
+st.set_page_config(page_title="Lojistik Konteyner & B/L Takip Masası", page_icon="🚢", layout="wide")
 
 @st.cache_resource
 def setup_playwright():
@@ -18,184 +18,204 @@ def setup_playwright():
 setup_playwright()
 from playwright.sync_api import sync_playwright
 
-# Standart Öz Mal Haritası
-KNOWN_PREFIXES = {
-    'AKK': 'AKKON',
-    'ARK': 'ARKAS',
-    'TRK': 'TURKON',
-    'MED': 'MEDKON',
-    'MSC': 'MSC',
-    'MAE': 'MAERSK',
-    'MSK': 'MAERSK',
-    'CMA': 'CMA',
-    'HLC': 'HAPAG',
-    'SLL': 'SEALEAD',
-    'COS': 'COSCO',
-    'ONE': 'ONE',
-    'ZIM': 'ZIM'
-}
+def parse_date(date_str):
+    """Farklı armatör tarih formatlarını datetime nesnesine çevirir"""
+    if not date_str or date_str == "-":
+        return None
+    cleaned = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', str(date_str)).strip()
+    formats = [
+        "%d %b %Y", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d",
+        "%d %B %Y", "%b %d, %Y", "%d %b %Y %H:%M"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except Exception:
+            continue
+    return None
 
-# 1. CMA CGM
+def calculate_transit_days(dep_date_str, arr_date_str):
+    """POL ve POD tarihleri arasındaki transit süresini hesaplar"""
+    d1 = parse_date(dep_date_str)
+    d2 = parse_date(arr_date_str)
+    if d1 and d2:
+        diff = (d2 - d1).days
+        return f"{diff} Gün" if diff >= 0 else "-"
+    return "-"
+
+# 1. CMA CGM MOTORU
 def check_cma(page, code):
     try:
         url = f"https://www.cma-cgm.com/ebusiness/tracking/search?SearchBy=Container&Reference={code}"
-        page.goto(url, timeout=25000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
+        page.goto(url, timeout=30000, wait_until="networkidle")
+        page.wait_for_timeout(4000)
+        
         content = page.content()
         
-        if "No container found" in content or "not found" in content.lower():
+        # Hatalı/Boş arama kontrolü
+        if "No matching container found" in content or "not found" in content.lower() or "No data available" in content:
             return None
-            
-        status = "In Transit"
-        if "Discharged" in content or "Tahliye" in content:
-            status = "Tahliye Edildi (POD)"
-        elif "Delivered" in content:
-            status = "Teslim Edildi"
-        elif "Loaded" in content:
-            status = "Gemide (Loaded)"
-            
-        loc_match = re.search(r'\b(ONNE|MERSIN|AMBARLI|PORT SAID|JEBEL ALI|TANGER|DURBAN|CASABLANCA|ANTWERP)\b', content, re.IGNORECASE)
-        loc = loc_match.group(0).upper() if loc_match else "POD Limanı"
         
-        date_match = re.findall(r'\b\d{1,2}[\s\-\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/]+\d{4}\b', content, re.IGNORECASE)
-        eta = date_match[-1] if date_match else "Limanda / Tamamlandı"
+        # Sayfada container numarası geçiyor mu kontrolü
+        if code not in content.upper():
+            return None
+
+        # POL (Yükleme Limanı ve Tarihi)
+        pol_match = re.search(r'(MERSIN|AMBARLI|ALIAGA|IZMIR|GEMLIK|PORT SAID)', content, re.IGNORECASE)
+        pol = pol_match.group(0).upper() if pol_match else "Yükleme Limanı"
         
-        return {"carrier": "CMA CGM", "loc": loc, "status": status, "eta": eta}
+        # POD (Tahliye Limanı)
+        pod_match = re.search(r'(ONNE|TANGER|DURBAN|CASABLANCA|ANTWERP|JEBEL ALI|DAKAR)', content, re.IGNORECASE)
+        pod = pod_match.group(0).upper() if pod_match else "Varış Limanı"
+
+        # Tarihler
+        dates = re.findall(r'\b\d{1,2}[\s\-\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/]+\d{4}\b', content, re.IGNORECASE)
+        
+        departure_date = dates[0] if len(dates) >= 1 else "-"
+        arrival_date = dates[-1] if len(dates) >= 2 else (dates[0] if dates else "-")
+
+        # Statü Kararı
+        if "discharged" in content.lower() or "tahliye" in content.lower():
+            status = "Tahliye Edildi (Vardı)"
+        elif "delivered" in content.lower() or "empty return" in content.lower():
+            status = "Teslim Edildi / Boş İade"
+        elif "loaded" in content.lower():
+            status = "Gemide / Seferde"
+        else:
+            status = "Seferde (In Transit)"
+
+        transit_days = calculate_transit_days(departure_date, arrival_date)
+
+        return {
+            "carrier": "CMA CGM",
+            "pol": pol,
+            "pol_date": departure_date,
+            "pod": pod,
+            "pod_date": arrival_date,
+            "transit_days": transit_days,
+            "status": status
+        }
     except Exception:
         return None
 
-# 2. MAERSK
+# 2. MAERSK MOTORU
 def check_maersk(page, code):
     try:
         url = f"https://www.maersk.com/tracking/{code}"
-        page.goto(url, timeout=25000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(4500)
+        
         content = page.content()
         
-        if "no results" in content.lower() or "not found" in content.lower():
+        # Kesin negatif doğrulaması (Maersk kayıt yoksa hemen geçilsin)
+        if "could not find any results" in content.lower() or "no records found" in content.lower() or "search returned no results" in content.lower():
             return None
-            
-        status = "In Transit"
-        if "Discharged" in content:
-            status = "Tahliye Edildi (POD)"
-        elif "Gate out" in content or "Delivered" in content:
-            status = "Teslim / Boş İade"
-            
-        loc_match = re.search(r'\b(MERSIN|AMBARLI|IZMIR|JEBEL ALI|PORT SAID|ONNE|TANGER|BREMERHAVEN|ROTTERDAM)\b', content, re.IGNORECASE)
-        loc = loc_match.group(0).upper() if loc_match else "Varış Terminali"
         
-        date_match = re.findall(r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\b', content, re.IGNORECASE)
-        eta = date_match[-1] if date_match else "Tamamlandı"
-        
-        return {"carrier": "MAERSK", "loc": loc, "status": status, "eta": eta}
+        # Maersk arayüzünde aktif veri kartı yoksa None dön
+        if "tracking-result" not in content.lower() and "stepper" not in content.lower() and code not in content.upper():
+            return None
+
+        # Limanlar
+        pol_match = re.search(r'(MERSIN|AMBARLI|IZMIR|PORT SAID|JEBEL ALI)', content, re.IGNORECASE)
+        pol = pol_match.group(0).upper() if pol_match else "Yükleme Limanı"
+
+        pod_match = re.search(r'(AMBARLI|MERSIN|BREMERHAVEN|ROTTERDAM|ONNE|TANGER|JEBEL ALI)', content, re.IGNORECASE)
+        pod = pod_match.group(0).upper() if pod_match else "Varış Limanı"
+
+        # Tarihler
+        dates = re.findall(r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\b', content, re.IGNORECASE)
+        departure_date = dates[0] if len(dates) >= 1 else "-"
+        arrival_date = dates[-1] if len(dates) >= 2 else (dates[0] if dates else "-")
+
+        # Statü (Vardı mı yoksa daha varmadı mı?)
+        if "discharged" in content.lower():
+            status = "Tahliye Edildi (Vardı)"
+        elif "delivered" in content.lower() or "gate out" in content.lower():
+            status = "Teslim Edildi"
+        elif "load" in content.lower():
+            status = "Gemide / Yolda (Varmadı)"
+        else:
+            status = "Yolda / Seferde (Varmadı)"
+
+        transit_days = calculate_transit_days(departure_date, arrival_date)
+
+        return {
+            "carrier": "MAERSK",
+            "pol": pol,
+            "pol_date": departure_date,
+            "pod": pod,
+            "pod_date": arrival_date,
+            "transit_days": transit_days,
+            "status": status
+        }
     except Exception:
         return None
 
-# 3. HAPAG-LLOYD
-def check_hapag(page, code):
-    try:
-        url = f"https://www.hapag-lloyd.com/en/online-business/track/track-by-container-solution.html?container={code}"
-        page.goto(url, timeout=25000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
-        content = page.content()
-        
-        if "could not be found" in content.lower() or "no data" in content.lower():
-            return None
-            
-        status = "In Transit"
-        if "delivered" in content.lower(): status = "Teslim Edildi"
-        elif "discharged" in content.lower(): status = "Tahliye Edildi (POD)"
-        
-        loc_match = re.search(r'\b(MERSIN|IZMIR|AMBARLI|GENOA|ANTWERP|HAMBURG|JEBEL ALI)\b', content, re.IGNORECASE)
-        loc = loc_match.group(0).upper() if loc_match else "Hapag Terminali"
-        
-        return {"carrier": "HAPAG-LLOYD", "loc": loc, "status": status, "eta": "Takip Ediliyor"}
-    except Exception:
-        return None
-
-# 4. SEALEAD
-def check_sealead(page, code):
-    try:
-        url = f"https://sealead.com/tracking/?tracking_type=cntr&tracking_number={code}"
-        page.goto(url, timeout=25000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
-        content = page.content()
-        
-        if "invalid" in content.lower() or "no records" in content.lower():
-            return None
-            
-        return {"carrier": "SEALEAD", "loc": "Akdeniz / Kızıldeniz Hattı", "status": "In Transit", "eta": "Aktif Sefer"}
-    except Exception:
-        return None
-
-# 5. AKKON LINES
+# 3. AKKON LINES MOTORU
 def check_akkon(page, code):
     try:
         page.goto("https://www.akkonlines.com/tr/tracking", timeout=20000)
         page.fill("input[name='search']", code)
         page.press("input[name='search']", "Enter")
-        page.wait_for_timeout(3000)
-        content = page.content()
+        page.wait_for_timeout(3500)
         
-        if "bulunamadı" in content.lower() or "kayıt yok" in content.lower():
+        content = page.content()
+        if "kayıt bulunamadı" in content.lower() or "no records" in content.lower():
             return None
             
-        status = page.locator(".status-text").first.inner_text() if page.locator(".status-text").count() > 0 else "Aktif"
-        loc = page.locator(".current-port").first.inner_text() if page.locator(".current-port").count() > 0 else "Mersin / Akkon Port"
-        eta = page.locator(".eta-date").first.inner_text() if page.locator(".eta-date").count() > 0 else "Limanda"
-        return {"carrier": "AKKON LINES", "loc": loc, "status": status, "eta": eta}
+        pol = "Mersin / Çıkış"
+        pod = page.locator(".current-port").first.inner_text() if page.locator(".current-port").count() > 0 else "Varış Limanı"
+        arr_date = page.locator(".eta-date").first.inner_text() if page.locator(".eta-date").count() > 0 else "-"
+        status = page.locator(".status-text").first.inner_text() if page.locator(".status-text").count() > 0 else "Seferde"
+
+        return {
+            "carrier": "AKKON LINES",
+            "pol": pol,
+            "pol_date": "-",
+            "pod": pod,
+            "pod_date": arr_date,
+            "transit_days": "-",
+            "status": status
+        }
     except Exception:
         return None
 
-# Akıllı ShipsGo Tarama Fonksiyonu
-def smart_track(page, code, manual_hint=None):
+# Akıllı Hat Dağıtıcı (Doğrulamalı)
+def smart_track(page, code):
     clean_code = code.strip().upper()
-    prefix = clean_code[:3]
     
-    # 1. Kullanıcı elle ipucu verdiyse doğrudan o hatta git
-    if manual_hint:
-        h = manual_hint.upper()
-        if "CMA" in h: return check_cma(page, clean_code) or {"carrier": "CMA", "loc": "Kayıt Bulunamadı", "status": "Pasif", "eta": "-"}
-        if "MAE" in h: return check_maersk(page, clean_code) or {"carrier": "MAERSK", "loc": "Kayıt Bulunamadı", "status": "Pasif", "eta": "-"}
-        if "HAP" in h: return check_hapag(page, clean_code) or {"carrier": "HAPAG", "loc": "Kayıt Bulunamadı", "status": "Pasif", "eta": "-"}
-        if "SEA" in h: return check_sealead(page, clean_code) or {"carrier": "SEALEAD", "loc": "Kayıt Bulunamadı", "status": "Pasif", "eta": "-"}
-        if "AKK" in h: return check_akkon(page, clean_code) or {"carrier": "AKKON", "loc": "Kayıt Bulunamadı", "status": "Pasif", "eta": "-"}
-
-    # 2. Öz Mal İse Doğrudan İlgili Hatta Git
-    if prefix in KNOWN_PREFIXES:
-        carrier = KNOWN_PREFIXES[prefix]
-        if carrier == "AKKON": res = check_akkon(page, clean_code)
-        elif carrier == "MAERSK": res = check_maersk(page, clean_code)
-        elif carrier == "CMA": res = check_cma(page, clean_code)
-        elif carrier == "HAPAG": res = check_hapag(page, clean_code)
-        elif carrier == "SEALEAD": res = check_sealead(page, clean_code)
-        else: res = None
-        if res: return res
-
-    # 3. KİRALIK KONTEYNER (CAIU, TIIU, TGHU vb.) -> SHIPSGO GİBİ SIRAYLA HATLARI DENE
-    search_engines = [check_maersk, check_cma, check_hapag, check_sealead, check_akkon]
-    for engine in search_engines:
-        res = engine(page, clean_code)
-        if res: # Hangi hat "Bu bende var" derse onu döndür
-            return res
+    # Kiralık veya öz mal ayrımı yapmaksızın hatları sırayla sorgula
+    engines = [check_cma, check_maersk, check_akkon]
+    for engine in engines:
+        data = engine(page, clean_code)
+        if data: # Hat gerçek bir veri döndürdüyse kabul et
+            return data
             
-    return {"carrier": "Bilinmeyen Hat / Bulunamadı", "loc": "-", "status": "Aktif Sefer Kaydı Yok", "eta": "-"}
+    return {
+        "carrier": "Bulunamadı",
+        "pol": "-",
+        "pol_date": "-",
+        "pod": "-",
+        "pod_date": "-",
+        "transit_days": "-",
+        "status": "Aktif Sefer Kaydı Tespit Edilemedi"
+    }
 
 # Arayüz
-st.title("🚢 Akıllı Konteyner & B/L Takip Masası (ShipsGo Modu)")
-st.write("Numaraları doğrudan yapıştırın. `CAIU`, `TIIU` gibi kiralık kodlar hat yazmasanız bile otomatik taranır.")
+st.title("🚢 Detaylı Lojistik Konteyner & B/L Takip Masası")
+st.write("Konteyner numaralarını alt alta girin. Hat, liman, yükleme/varış tarihleri ve transit süreleri otomatik hesaplanır.")
 
 raw_input = st.text_area(
-    "Konteyner Numaraları (Alt alta yapıştırın):",
-    height=160,
-    placeholder="TIIU2680745\nCAIU9639822\nAKKU1234567"
+    "Konteyner Numaraları:",
+    height=150,
+    placeholder="TIIU2680745\nCAIU9639822"
 )
 
-if st.button("🚀 Otomatik Tara ve Sorgula", type="primary"):
+if st.button("🚀 Detaylı Sorgulamayı Başlat", type="primary"):
     lines = [x.strip() for x in raw_input.split("\n") if len(x.strip()) >= 7]
     
     if not lines:
-        st.warning("Lütfen en az bir numara girin.")
+        st.warning("Lütfen en az bir geçerli konteyner numarası girin.")
     else:
         results = []
         progress_bar = st.progress(0)
@@ -212,40 +232,39 @@ if st.button("🚀 Otomatik Tara ve Sorgula", type="primary"):
             page = context.new_page()
             
             total = len(lines)
-            for idx, item in enumerate(lines):
-                parts = item.split(":")
-                code = parts[0].strip().upper()
-                hint = parts[1].strip() if len(parts) > 1 else None
+            for idx, code in enumerate(lines):
+                status_text.text(f"Detaylı Takip Yapılıyor ({idx+1}/{total}): {code}...")
                 
-                status_text.text(f"Akıllı Tarama Yapılıyor ({idx+1}/{total}): {code}...")
-                
-                res = smart_track(page, code, hint)
+                info = smart_track(page, code)
                 
                 results.append({
                     "Sıra": idx + 1,
                     "Konteyner No": code,
-                    "Tespit Edilen Armatör": res["carrier"],
-                    "Mevcut Konum / Liman": res["loc"],
-                    "Güncel Statü": res["status"],
-                    "Varış / ETA": res["eta"],
-                    "Sorgu Zamanı": datetime.now().strftime("%d.%m.%Y %H:%M")
+                    "Armatör": info["carrier"],
+                    "Yükleme Limanı (POL)": info["pol"],
+                    "Yükleme Tarihi": info["pol_date"],
+                    "Varış Limanı (POD)": info["pod"],
+                    "Varış Tarihi (ETA/ATA)": info["pod_date"],
+                    "Transit Süresi": info["transit_days"],
+                    "Statü / Durum": info["status"]
                 })
                 
                 progress_bar.progress((idx + 1) / total)
             
             browser.close()
-            status_text.success("Tüm konteynerler tarandı!")
+            status_text.success("Tüm konteynerlerin detaylı sefer dökümü tamamlandı!")
 
         df = pd.DataFrame(results)
         st.dataframe(df, use_container_width=True)
         
+        # Excel
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name="Konteyner_Raporu")
+            df.to_excel(writer, index=False, sheet_name="Lojistik_Rapor")
         
         st.download_button(
             label="📥 Excel Olarak İndir (.xlsx)",
             data=buffer.getvalue(),
-            file_name=f"Konteyner_Takip_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"Konteyner_Detayli_Rapor_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
